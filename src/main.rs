@@ -13,7 +13,10 @@ use std::{
     io::{ErrorKind, Read, Seek},
     path::PathBuf,
     process::ExitCode,
-    sync::{atomic::AtomicBool, Arc},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
+    thread,
+    time::Duration,
 };
 
 use arraydeque::ArrayDeque;
@@ -35,6 +38,76 @@ compile_error!("This tool is only developed for Linux systems.");
 const PID_FILE: &str = "t2fand.pid";
 #[cfg(not(debug_assertions))]
 const PID_FILE: &str = "/run/t2fand.pid";
+
+// Constants for better readability
+const TEMP_BUFFER_SIZE: usize = 50;
+const STABLE_TEMP_SLEEP_DURATION: Duration = Duration::from_secs(1);
+const RESPONSIVE_SLEEP_DURATION: Duration = Duration::from_millis(100);
+const STABLE_TEMP_PADDING_COUNT: usize = 9;
+
+/// Represents the current temperature state and provides methods for temperature management
+struct TemperatureMonitor {
+    temp_buffer: String,
+    cpu_temp_file: std::fs::File,
+    gpu_temp_file: Option<std::fs::File>,
+    temperature_history: ArrayDeque<u8, TEMP_BUFFER_SIZE, arraydeque::Wrapping>,
+    last_mean_temp: u16,
+}
+
+impl TemperatureMonitor {
+    fn new(
+        temp_buffer: String,
+        cpu_temp_file: std::fs::File,
+        gpu_temp_file: Option<std::fs::File>,
+    ) -> Self {
+        Self {
+            temp_buffer,
+            cpu_temp_file,
+            gpu_temp_file,
+            temperature_history: ArrayDeque::new(),
+            last_mean_temp: 0,
+        }
+    }
+
+    /// Reads current temperatures and returns the higher of CPU/GPU
+    fn read_current_temperature(&mut self) -> Result<u8> {
+        let cpu_temp = read_temp_file(&mut self.cpu_temp_file, &mut self.temp_buffer)?;
+        
+        let current_temp = if let Some(gpu_temp_file) = &mut self.gpu_temp_file {
+            let gpu_temp = read_temp_file(gpu_temp_file, &mut self.temp_buffer)?;
+            cpu_temp.max(gpu_temp)
+        } else {
+            cpu_temp
+        };
+        
+        Ok(current_temp)
+    }
+
+    /// Adds a temperature reading to the history and calculates the mean
+    fn update_temperature_history(&mut self, temp: u8) -> u16 {
+        self.temperature_history.push_back(temp);
+        
+        let sum: u16 = self.temperature_history.iter().map(|&t| t as u16).sum();
+        sum / (self.temperature_history.len() as u16)
+    }
+
+    /// Checks if the temperature has stabilized (no change from last reading)
+    fn is_temperature_stable(&self, current_mean: u16) -> bool {
+        current_mean == self.last_mean_temp
+    }
+
+    /// Pads the temperature history when temperature is stable to maintain accuracy during longer sleep
+    fn pad_temperature_history_for_stable_period(&mut self, temp: u8) {
+        for _ in 0..STABLE_TEMP_PADDING_COUNT {
+            self.temperature_history.push_back(temp);
+        }
+    }
+
+    /// Updates the last known mean temperature
+    fn update_last_mean_temp(&mut self, mean_temp: u16) {
+        self.last_mean_temp = mean_temp;
+    }
+}
 
 fn get_current_euid() -> libc::uid_t {
     // SAFETY: FFI call with no preconditions
@@ -137,50 +210,62 @@ fn main() -> ExitCode {
     }
 }
 
+/// Updates all fan speeds based on the current temperature
+fn update_fan_speeds(fans: &NonEmptyVec<FanController>, temperature: u8) -> Result<()> {
+    for fan in fans {
+        let target_speed = fan.calc_speed(temperature);
+        fan.set_speed(target_speed)?;
+    }
+    Ok(())
+}
+
+/// Handles the sleep logic based on whether temperature has changed
+fn handle_sleep_cycle(
+    temperature_monitor: &mut TemperatureMonitor,
+    current_temp: u8,
+    mean_temp: u16,
+    is_stable: bool,
+) {
+    if is_stable {
+        // Temperature is stable - use longer sleep but pad history to maintain accuracy
+        temperature_monitor.pad_temperature_history_for_stable_period(current_temp);
+        thread::sleep(STABLE_TEMP_SLEEP_DURATION);
+    } else {
+        // Temperature changed - use shorter sleep for responsiveness
+        temperature_monitor.update_last_mean_temp(mean_temp);
+        thread::sleep(RESPONSIVE_SLEEP_DURATION);
+    }
+}
+
 fn start_temp_loop(
-    mut temp_buffer: String,
-    mut cpu_temp_file: std::fs::File,
-    mut gpu_temp_file: Option<std::fs::File>,
+    temp_buffer: String,
+    cpu_temp_file: std::fs::File,
+    gpu_temp_file: Option<std::fs::File>,
     fans: &NonEmptyVec<FanController>,
 ) -> Result<()> {
     let cancellation_token = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(SIGINT, cancellation_token.clone()).map_err(Error::Signal)?;
     signal_hook::flag::register(SIGTERM, cancellation_token.clone()).map_err(Error::Signal)?;
 
-    let mut last_temp = 0;
-    let mut temps = ArrayDeque::<u8, 50, arraydeque::Wrapping>::new();
-    while !cancellation_token.load(std::sync::atomic::Ordering::Relaxed) {
-        let cpu_temp = read_temp_file(&mut cpu_temp_file, &mut temp_buffer)?;
-        let temp = if let Some(gpu_temp_file) = &mut gpu_temp_file {
-            let gpu_temp = read_temp_file(gpu_temp_file, &mut temp_buffer)?;
-            if gpu_temp > cpu_temp {
-                gpu_temp
-            } else {
-                cpu_temp
-            }
-        } else {
-            cpu_temp
-        };
+    let mut temperature_monitor = TemperatureMonitor::new(temp_buffer, cpu_temp_file, gpu_temp_file);
 
-        temps.push_back(temp);
-
-        let sum_temp: u16 = temps.iter().map(|t| *t as u16).sum();
-        let mean_temp = sum_temp / (temps.len() as u16);
-        if mean_temp == last_temp {
-            // Avoid messing up the mean due to the longer sleep.
-            for _ in 0..9 {
-                temps.push_back(temp);
-            }
-
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        } else {
-            last_temp = mean_temp;
-            for fan in fans {
-                fan.set_speed(fan.calc_speed(mean_temp as u8))?;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(100));
+    while !cancellation_token.load(Ordering::Relaxed) {
+        // Read current temperature from sensors
+        let current_temp = temperature_monitor.read_current_temperature()?;
+        
+        // Update temperature history and calculate mean
+        let mean_temp = temperature_monitor.update_temperature_history(current_temp);
+        
+        // Check if temperature has stabilized
+        let is_stable = temperature_monitor.is_temperature_stable(mean_temp);
+        
+        // Update fan speeds only if temperature has changed
+        if !is_stable {
+            update_fan_speeds(fans, mean_temp as u8)?;
         }
+        
+        // Handle sleep cycle based on temperature stability
+        handle_sleep_cycle(&mut temperature_monitor, current_temp, mean_temp, is_stable);
     }
 
     Ok(())
